@@ -9,7 +9,8 @@ from django.core.urlresolvers import reverse
 from django.db import transaction
 from django.db.models import Q
 from django.http import Http404
-from django.utils.translation import ugettext as _
+from django.utils.translation import ugettext as _, get_language, activate
+from functools import reduce
 from wagtail.wagtailadmin.edit_handlers import FieldPanel, \
     MultiFieldPanel, FieldRowPanel
 from wagtail.wagtailadmin.edit_handlers import StreamFieldPanel
@@ -17,6 +18,7 @@ from wagtail.wagtailcore.models import Page, Site
 from wagtail.wagtailcore.url_routing import RouteResult
 from wagtail.wagtailimages.edit_handlers import ImageChooserPanel
 from wagtail.wagtailsearch.index import SearchField
+from wagtail_modeltranslation.exceptions import WagtailLanguageRedirect
 from wagtail.wagtailsnippets.views.snippets import get_snippet_edit_handler, \
     SNIPPET_EDIT_HANDLERS
 from wagtail_modeltranslation.translator import translator, NotRegistered
@@ -89,7 +91,7 @@ class WagtailTranslator(object):
                 f.required = True
 
         # Do the same to the formsets
-        for related_name, formset in form.formsets.iteritems():
+        for related_name, formset in form.formsets.items():
             if (formset.model in WagtailTranslator._required_fields and
                     WagtailTranslator._required_fields[formset.model]):
                 for fname, f in formset.form.base_fields.items():
@@ -394,31 +396,29 @@ def _new_route(self, request, path_components):
     """
     Rewrite route method in order to handle languages fallbacks
     """
+
+    request_language = get_language()
     if path_components:
         # request is for a child of this page
         child_slug = path_components[0]
         remaining_components = path_components[1:]
 
-        # try:
-        #     q = Q()
-        #     for lang in settings.LANGUAGES:
-        #         tr_field_name = 'slug_%s' % (lang[0])
-        #         condition = {tr_field_name: child_slug}
-        #         q |= Q(**condition)
-        #     subpage = self.get_children().get(q)
-        # except Page.DoesNotExist:
-        #     raise Http404
-
-        # return subpage.specific.route(request, remaining_components)
-
         subpages = self.get_children()
         for page in subpages:
             if page.specific.slug == child_slug:
                 return page.specific.route(request, remaining_components)
-        raise Http404
 
+            for language, _ in settings.LANGUAGES:
+                if getattr(page.specific, 'slug_{}'.format(language), None) == child_slug:
+                    if not remaining_components:
+                        raise WagtailLanguageRedirect(page.url)
+
+                    return page.specific.route(request, remaining_components)
+
+        raise Http404
     else:
         # request is for this very page
+
         if self.live:
             return RouteResult(self)
         else:
@@ -475,9 +475,11 @@ def _new_url(self):
     root_paths = self.get_site_root_paths()
 
     for (id, root_path, root_url) in root_paths:
-        if self.url_path.startswith(root_path):
+        url_path = getattr(self.specific, 'url_path')
+
+        if url_path.startswith(root_path):
             return ('' if len(root_paths) == 1 else root_url) + reverse(
-                'wagtail_serve', args=(self.url_path[len(root_path):],))
+                'wagtail_serve', args=(url_path[len(root_path):],))
 
 
 def _validate_slugs(page):
@@ -539,4 +541,4 @@ def _patch_elasticsearch_fields(model):
             for lang in settings.LANGUAGES:
                 translated_field = copy.deepcopy(field)
                 translated_field.field_name = build_localized_fieldname(field.field_name, lang[0])
-                model.search_fields = model.search_fields + (translated_field,)
+                model.search_fields = model.search_fields + [translated_field]
